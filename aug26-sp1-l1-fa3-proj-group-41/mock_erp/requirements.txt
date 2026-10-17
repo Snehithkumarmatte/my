@@ -1,0 +1,5 @@
+# mock-erp: FastAPI, Uvicorn, Pydantic and a PostgreSQL driver only
+fastapi>=0.115,<0.116
+uvicorn[standard]>=0.30,<0.33
+pydantic>=2.9,<3
+psycopg[binary]>=3.2,<3.3

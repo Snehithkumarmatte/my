@@ -1,0 +1,135 @@
+# AI Invoice Auditor - six services on one user-defined bridge network.
+# Services address each other by service name and CONTAINER port (postgres:5432,
+# qdrant:6333, redis:6379, mock-erp:8000, agent:8000). Host ports are only for your browser.
+# All secrets come from .env via env_file - nothing secret is written in this file.
+name: invoice-auditor
+
+services:
+  postgres:                       # system of record: erp + audit + langgraph schemas
+    image: postgres:16
+    env_file: .env                # POSTGRES_DB / POSTGRES_USER / POSTGRES_PASSWORD
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      # schema + ERP master data load automatically on the FIRST start of an empty volume
+      - ./backend/data/sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # ready = accepts connections AND the init scripts have created the ERP data
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} && psql -U $${POSTGRES_USER} -d $${POSTGRES_DB} -tAc 'SELECT 1 FROM erp.vendors LIMIT 1' | grep -q 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+    networks: [auditor-net]
+
+  qdrant:                         # derived vector index, rebuildable from PostgreSQL
+    image: qdrant/qdrant:v1.12.4
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      # the image has no curl/wget; bash /dev/tcp asks /readyz and requires HTTP 200
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333 && printf \"GET /readyz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n\" >&3 && grep -q \"200 OK\" <&3'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+    networks: [auditor-net]
+
+  redis:                          # disposable LLM/translation cache - deliberately NO volume
+    image: redis:7.2
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    tmpfs:
+      - /data                     # stops the image's VOLUME /data creating an anonymous volume
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    networks: [auditor-net]
+
+  mock-erp:                       # the ONLY route to ERP data (reads the erp schema)
+    build: ./mock_erp
+    image: invoice-mock-erp:1.0
+    env_file: .env                # DATABASE_URL
+    ports:
+      - "8001:8000"               # host 8001 -> container 8000; other containers use mock-erp:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+    networks: [auditor-net]
+
+  agent:                          # LangGraph workflow; the only service that writes application data
+    build:
+      context: ./backend
+      args:
+        APP_UID: ${APP_UID:-1000} # match the host user so the bind-mounted folders are writable
+    image: invoice-agent:1.0
+    env_file: .env                # DATABASE_URL, REDIS_URL, QDRANT_URL, ERP_BASE_URL, AWS_*, LLM_*
+    environment:
+      INCOMING_DIR: /app/backend/data/incoming
+      REPORTS_DIR: /app/backend/data/reports
+    ports:
+      - "8000:8000"
+    volumes:
+      # invoice files stay on the filesystem; the database stores only path + checksum.
+      # (in production this would be object storage such as S3)
+      - ./backend/data/incoming:/app/backend/data/incoming
+      - ./backend/data/reports:/app/backend/data/reports
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mock-erp:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=8).status == 200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+    restart: unless-stopped
+    networks: [auditor-net]
+
+  streamlit-ui:                   # human-in-the-loop dashboard: reads audit schema, calls the agent
+    build: ./frontend
+    image: invoice-streamlit-ui:1.0
+    env_file: .env                # DATABASE_URL, AGENT_URL
+    ports:
+      - "8501:8501"
+    depends_on:
+      agent:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8501/_stcore/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    networks: [auditor-net]
+
+volumes:
+  pg_data:                        # survives `docker compose down`, deleted by `down -v`
+  qdrant_data:
+
+networks:
+  auditor-net:
+    driver: bridge

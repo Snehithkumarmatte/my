@@ -1,0 +1,160 @@
+# =============================================================
+# AI Invoice Auditor – Validation Rules Configuration
+# Read by: invoice_monitor_agent, validation_agent,
+#          business_validation_agent, reporting_agent
+# =============================================================
+
+# -------------------------------------------------------------
+# 0. Invoice monitoring
+# -------------------------------------------------------------
+monitoring:
+  incoming_dir: "data/incoming"          # relative to /app inside the container (bind-mounted)
+  poll_interval_seconds: 10
+  supported_extensions: [".pdf", ".docx", ".png", ".jpg", ".jpeg"]
+  metadata_suffix: ".meta.json"          # simulated email header, stored in extracted_raw
+  checksum_algorithm: "sha256"
+
+# -------------------------------------------------------------
+# 1. Required fields (Invoice Data Validation Agent)
+# -------------------------------------------------------------
+required_fields:
+  header:
+    - invoice_no
+    - invoice_date
+    - vendor_name          # invoices carry the NAME; vendor_id is resolved via mock-erp /vendors?name=
+    - po_number            # needed to fetch the PO from mock-erp
+    - currency
+    - total_amount
+  line_item:
+    - item_code
+    - description
+    - qty
+    - unit_price
+    - total
+
+# Missing any of these alone is enough to reject (cannot be audited at all)
+critical_fields:
+  - invoice_no
+  - currency
+  - total_amount
+
+# -------------------------------------------------------------
+# 2. Field data types  (money = decimal, never float)
+# -------------------------------------------------------------
+data_types:
+  invoice_no: str
+  invoice_date: date
+  vendor_name: str
+  po_number: str
+  currency: str
+  total_amount: decimal
+  qty: decimal
+  unit_price: decimal
+  total: decimal
+
+date_formats:            # tried in order when parsing invoice_date
+  - "%Y-%m-%d"
+  - "%d/%m/%Y"
+  - "%d.%m.%Y"           # German
+  - "%d-%m-%Y"
+  - "%B %d, %Y"
+  - "%d %B %Y"
+
+# -------------------------------------------------------------
+# 3. Arithmetic checks (Invoice Data Validation Agent)
+# -------------------------------------------------------------
+arithmetic:
+  line_total_rounding_abs: 0.02        # |qty*unit_price - line total| allowed
+  invoice_total_rounding_abs: 0.05     # |sum(lines) + tax - total_amount| allowed
+
+tax:
+  rate_source: "sku_master"            # gst_rate from mock-erp /sku/{code}
+  default_rate_percent: 10             # used if SKU lookup fails
+  tax_inclusive_total: false           # total_amount = subtotal + tax
+
+# -------------------------------------------------------------
+# 4. Business validation thresholds (invoice vs ERP PO)
+# -------------------------------------------------------------
+tolerances:
+  price_difference_percent: 5          # ±5% unit price
+  quantity_difference_percent: 0       # quantity must match exactly
+  tax_difference_percent: 2            # ±2% tax amount
+  total_difference_percent: 2          # invoice total vs PO-derived total
+
+# Severity by deviation size (stored in audit.discrepancies.severity)
+severity_bands:
+  low:    { max_deviation_percent: 5 }     # within or just over tolerance
+  medium: { max_deviation_percent: 15 }
+  high:   { max_deviation_percent: null }  # anything larger
+
+# Discrepancies that are always HIGH regardless of percentage
+always_high:
+  - currency_mismatch
+  - po_not_found
+  - item_not_on_po
+  - vendor_mismatch
+
+# -------------------------------------------------------------
+# 5. Currency rules
+# -------------------------------------------------------------
+accepted_currencies: [USD, EUR, INR, GBP]
+
+currency_symbol_map:
+  "$": "USD"
+  "€": "EUR"
+  "₹": "INR"
+  "£": "GBP"
+
+currency_must_match_po: true
+
+# -------------------------------------------------------------
+# 6. Decision policy  → audit.invoice_audit.recommendation
+#    Allowed values: approve | manual_review | reject
+#    Evaluated top to bottom; first match wins.
+# -------------------------------------------------------------
+validation_policies:
+  missing_field_action: "manual_review"      # non-critical required field missing
+  total_mismatch_action: "manual_review"
+  invalid_currency_action: "reject"
+  auto_approve_confidence_threshold: 0.85    # English invoices count as 1.0
+
+decision_rules:
+  - when: "missing_critical_field"     # e.g. INV_EN_006_malformed
+    recommendation: "reject"
+    validation_status: "failed"
+  - when: "invalid_currency"
+    recommendation: "reject"
+    validation_status: "failed"
+  - when: "any_high_discrepancy"
+    recommendation: "reject"
+    validation_status: "failed"
+  - when: "any_medium_discrepancy"
+    recommendation: "manual_review"
+    validation_status: "partial"
+  - when: "missing_noncritical_field"
+    recommendation: "manual_review"
+    validation_status: "partial"
+  - when: "translation_confidence_below_threshold"
+    recommendation: "manual_review"
+    validation_status: "partial"
+  - when: "only_low_or_none"
+    recommendation: "approve"
+    validation_status: "passed"
+
+# -------------------------------------------------------------
+# 7. Reporting
+# -------------------------------------------------------------
+reporting:
+  include_translation_confidence: true
+  include_discrepancy_summary: true
+  include_missing_fields: true
+  report_formats: ["json", "html"]       # spec requires both
+  output_dir: "data/reports"             # relative to /app – this folder IS mounted
+  # The database (audit schema) is the system of record; files are a convenience copy.
+
+# -------------------------------------------------------------
+# 8. Logging
+# -------------------------------------------------------------
+logging:
+  log_level: "INFO"
+  destination: "stdout"                  # never log to files inside the container
